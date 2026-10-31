@@ -24,7 +24,7 @@ import { headers } from "../configs/header.config.js";
 // ══════════════════════════════════════════════════════════════
 
 const SCRAPER_API_KEY = process.env.SCRAPER_API_KEY;
-const FLARESOLVERR_URL = (process.env.FLARESOLVERR_URL || "").replace(/\\/+$/, "");
+const FLARESOLVERR_URL = (process.env.FLARESOLVERR_URL || "").replace(/\/+$/, "");
 const FLARESOLVERR_SESSION_IDLE_MS = Number.parseInt(process.env.FLARESOLVERR_SESSION_IDLE_MS || "900000", 10);
 const FLARESOLVERR_MAX_TIMEOUT = Number.parseInt(process.env.FLARESOLVERR_MAX_TIMEOUT || "60000", 10);
 
@@ -214,7 +214,9 @@ async function fetchViaFlareSolverr(url, options = {}) {
 
   let targetUrl;
   try {
-    targetUrl = new URL(url).href;
+    const parsedUrl = new URL(url);
+    if (!["http:", "https:"].includes(parsedUrl.protocol)) throw new Error("Unsupported URL protocol");
+    targetUrl = parsedUrl.href;
   } catch {
     throw new Error("FlareSolverr requires an absolute HTTP(S) URL");
   }
