@@ -36,83 +36,101 @@ import { normalizeServerName } from "./streamResolver.extractor.js";
  * retained for backward compatibility.
  */
 const fetchAniKotoAjax = async (mirror, watchSlug, path) => {
+  let flareSolverrError = null;
+
   if (getProxyStatus().flaresolverr.enabled) {
     const bootstrapPaths = watchSlug
       ? [`/watch/${encodeURIComponent(watchSlug)}`, "/home"]
       : ["/home"];
 
-    let bootstrap = null;
-    let bootstrapError = null;
-
-    for (const pagePath of bootstrapPaths) {
-      try {
-        bootstrap = await fetchViaFlareSolverr(new URL(pagePath, `${mirror}/`).href, {
-          timeout: 45000,
-        });
-        break;
-      } catch (error) {
-        bootstrapError = error;
-      }
-    }
-
-    if (!bootstrap) {
-      throw new Error(
-        `Could not establish AniKoto browser session through FlareSolverr: ${bootstrapError?.message || "unknown error"}`
-      );
-    }
-
-    const ajaxUrl = new URL(path, `${mirror}/`).href;
-    const response = await fetchViaFlareSolverr(ajaxUrl, {
-      timeout: 45000,
-      sessionId: bootstrap.sessionId,
-    });
-
-    return response.data;
-  }
-
-  // Legacy direct path: keep the watch-page cookie and AJAX request together.
-  let cookieHeader = "";
-  const bootstrapUrl = watchSlug
-    ? `${mirror}/watch/${encodeURIComponent(watchSlug)}`
-    : `${mirror}/home`;
-
-  try {
-    const sessionRes = await axios.get(bootstrapUrl, {
-      headers,
-      timeout: 10000,
-      maxRedirects: 5,
-    });
-    const setCookies = sessionRes.headers["set-cookie"];
-    if (Array.isArray(setCookies)) {
-      cookieHeader = setCookies.map((cookie) => cookie.split(";")[0]).join("; ");
-    }
-  } catch {
-    // Try the homepage below if the watch page did not establish a session.
-  }
-
-  if (!cookieHeader && watchSlug) {
     try {
-      const fallbackRes = await axios.get(`${mirror}/home`, {
+      let bootstrap = null;
+      let bootstrapError = null;
+
+      for (const pagePath of bootstrapPaths) {
+        try {
+          bootstrap = await fetchViaFlareSolverr(new URL(pagePath, `${mirror}/`).href, {
+            timeout: 45000,
+          });
+          break;
+        } catch (error) {
+          bootstrapError = error;
+        }
+      }
+
+      if (!bootstrap) {
+        throw new Error(
+          `Could not establish browser session: ${bootstrapError?.message || "unknown error"}`
+        );
+      }
+
+      const ajaxUrl = new URL(path, `${mirror}/`).href;
+      const response = await fetchViaFlareSolverr(ajaxUrl, {
+        timeout: 45000,
+        sessionId: bootstrap.sessionId,
+      });
+
+      return response.data;
+    } catch (error) {
+      flareSolverrError = error;
+      console.warn(`[STREAM] FlareSolverr extraction failed; trying direct session: ${error.message}`);
+    }
+  }
+
+  // Direct fallback: keep the watch-page cookie and AJAX request on the same
+  // API host/network path. This also preserves operation when FlareSolverr is
+  // temporarily unavailable.
+  try {
+    let cookieHeader = "";
+    const bootstrapUrl = watchSlug
+      ? `${mirror}/watch/${encodeURIComponent(watchSlug)}`
+      : `${mirror}/home`;
+
+    try {
+      const sessionRes = await axios.get(bootstrapUrl, {
         headers,
         timeout: 10000,
         maxRedirects: 5,
       });
-      const setCookies = fallbackRes.headers["set-cookie"];
+      const setCookies = sessionRes.headers["set-cookie"];
       if (Array.isArray(setCookies)) {
         cookieHeader = setCookies.map((cookie) => cookie.split(";")[0]).join("; ");
       }
     } catch {
-      // The AJAX request below will report the upstream failure.
+      // Try the homepage below if the watch page did not establish a session.
     }
-  }
 
-  const requestHeaders = {
-    ...headers,
-    "X-Requested-With": "XMLHttpRequest",
-    ...(cookieHeader ? { Cookie: cookieHeader } : {}),
-  };
-  const { data } = await fetchWithMirror(path, { headers: requestHeaders });
-  return data;
+    if (!cookieHeader && watchSlug) {
+      try {
+        const fallbackRes = await axios.get(`${mirror}/home`, {
+          headers,
+          timeout: 10000,
+          maxRedirects: 5,
+        });
+        const setCookies = fallbackRes.headers["set-cookie"];
+        if (Array.isArray(setCookies)) {
+          cookieHeader = setCookies.map((cookie) => cookie.split(";")[0]).join("; ");
+        }
+      } catch {
+        // The AJAX request below will report the upstream failure.
+      }
+    }
+
+    const requestHeaders = {
+      ...headers,
+      "X-Requested-With": "XMLHttpRequest",
+      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+    };
+    const { data } = await fetchWithMirror(path, { headers: requestHeaders });
+    return data;
+  } catch (directError) {
+    if (flareSolverrError) {
+      throw new Error(
+        `FlareSolverr failed (${flareSolverrError.message}); direct fallback failed (${directError.message})`
+      );
+    }
+    throw directError;
+  }
 };
 
 const parseAniKotoAjaxResponse = (raw, endpointName) => {
