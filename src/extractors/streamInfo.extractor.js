@@ -122,7 +122,7 @@ const parseAniKotoAjaxResponse = (raw, endpointName) => {
     try {
       parsed = JSON.parse(raw);
     } catch {
-      const preview = raw.slice(0, 120).replace(/\\s+/g, " ");
+      const preview = raw.slice(0, 120).replace(/\s+/g, " ");
       throw new Error(
         `AniKoto ${endpointName} endpoint returned non-JSON data. FlareSolverr navigation may not be sending the X-Requested-With AJAX header. Response: ${preview}`
       );
