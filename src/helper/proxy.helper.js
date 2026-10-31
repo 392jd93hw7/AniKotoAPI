@@ -9,7 +9,8 @@
  *   Automatically routes requests through proxy when direct requests fail.
  *
  * @exports
- *   fetchWithProxy, getProxyStatus
+ *   fetchWithProxy, fetchViaFlareSolverr, getFlareSolverrSession,
+ *   destroyFlareSolverrSession, getProxyStatus
  *
  * @author  Shinei Nouzen
  * @license MIT
@@ -104,7 +105,7 @@ async function fetchViaScraperApi(url, options = {}) {
  */
 /**
  * Send a command to the FlareSolverr v1 API.
- * FlareSolverr 3.x manages browser cookies inside its named session. Its API
+ * FlareSolverr 3.x manages browser cookies inside its persistent browser session. Its API
  * does not expose arbitrary per-request headers, so callers must not assume
  * that X-Requested-With or other custom AJAX headers can be injected.
  */
