@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- Reuse persistent FlareSolverr browser sessions for AniKoto watch-page and streaming AJAX requests.
+- Report non-JSON or malformed upstream AJAX responses instead of silently treating them as empty server results.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
