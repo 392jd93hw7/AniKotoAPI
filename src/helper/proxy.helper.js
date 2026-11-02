@@ -9,7 +9,8 @@
  *   Automatically routes requests through proxy when direct requests fail.
  *
  * @exports
- *   fetchWithProxy, getProxyStatus
+ *   fetchWithProxy, fetchViaFlareSolverr, getFlareSolverrSession,
+ *   destroyFlareSolverrSession, getProxyStatus
  *
  * @author  Shinei Nouzen
  * @license MIT
@@ -24,7 +25,13 @@ import { headers } from "../configs/header.config.js";
 // ══════════════════════════════════════════════════════════════
 
 const SCRAPER_API_KEY = process.env.SCRAPER_API_KEY;
-const FLARESOLVERR_URL = process.env.FLARESOLVERR_URL;
+const FLARESOLVERR_URL = (process.env.FLARESOLVERR_URL || "").replace(/\/+$/, "");
+const FLARESOLVERR_SESSION_IDLE_MS = Number.parseInt(process.env.FLARESOLVERR_SESSION_IDLE_MS || "900000", 10);
+const FLARESOLVERR_MAX_TIMEOUT = Number.parseInt(process.env.FLARESOLVERR_MAX_TIMEOUT || "60000", 10);
+
+let flareSolverrSessionId = null;
+let flareSolverrLastUsedAt = 0;
+let flareSolverrSessionPromise = null;
 
 // ScraperAPI endpoint
 const SCRAPER_API_URL = "http://api.scraperapi.com";
@@ -96,30 +103,191 @@ async function fetchViaScraperApi(url, options = {}) {
  * @param {Object} options - Request options
  * @returns {Promise<{data: string, proxy: string}>}
  */
-async function fetchViaFlareSolverr(url, options = {}) {
-  const { timeout = 60000, returnType = "text" } = options;
+/**
+ * Send a command to the FlareSolverr v1 API.
+ * FlareSolverr 3.x manages browser cookies inside its persistent browser session. Its API
+ * does not expose arbitrary per-request headers, so callers must not assume
+ * that X-Requested-With or other custom AJAX headers can be injected.
+ */
+async function sendFlareSolverrCommand(payload, timeout = 70000) {
+  if (!FLARESOLVERR_URL) {
+    throw new Error("FlareSolverr is not configured (FLARESOLVERR_URL is missing)");
+  }
 
   const response = await axios.post(
     `${FLARESOLVERR_URL}/v1`,
-    {
-      cmd: "request.get",
-      url: url,
-      maxTimeout: timeout,
-    },
+    payload,
     {
       headers: { "Content-Type": "application/json" },
-      timeout: timeout + 10000,
+      timeout,
     }
   );
 
-  if (response.data.status === "ok") {
-    return {
-      data: response.data.solution.response,
-      proxy: "flaresolverr",
-    };
+  if (response.data?.status !== "ok") {
+    throw new Error(`FlareSolverr error: ${response.data?.message || "Unknown FlareSolverr error"}`);
   }
 
-  throw new Error(`FlareSolverr error: ${response.data.message}`);
+  return response.data;
+}
+
+/**
+ * Destroy the current FlareSolverr session, if one exists.
+ * This is also used to recover from a server-side expired session.
+ */
+async function destroyFlareSolverrSession(sessionId = flareSolverrSessionId) {
+  if (!sessionId) return;
+
+  if (sessionId === flareSolverrSessionId) {
+    flareSolverrSessionId = null;
+    flareSolverrLastUsedAt = 0;
+  }
+
+  try {
+    await sendFlareSolverrCommand(
+      { cmd: "sessions.destroy", session: sessionId },
+      15000
+    );
+  } catch (error) {
+    // A session may already have expired on the FlareSolverr side.
+    console.log(`[PROXY] FlareSolverr session cleanup: ${error.message}`);
+  }
+}
+
+/**
+ * Return a reusable FlareSolverr browser session.
+ * Concurrent first requests share one session-creation promise.
+ */
+async function getFlareSolverrSession() {
+  if (!FLARESOLVERR_URL) {
+    throw new Error("FlareSolverr is not configured (FLARESOLVERR_URL is missing)");
+  }
+
+  const isFresh =
+    flareSolverrSessionId &&
+    Date.now() - flareSolverrLastUsedAt < FLARESOLVERR_SESSION_IDLE_MS;
+
+  if (isFresh) return flareSolverrSessionId;
+  if (flareSolverrSessionPromise) return flareSolverrSessionPromise;
+
+  flareSolverrSessionPromise = (async () => {
+    if (flareSolverrSessionId) {
+      await destroyFlareSolverrSession(flareSolverrSessionId);
+    }
+
+    const result = await sendFlareSolverrCommand(
+      { cmd: "sessions.create" },
+      20000
+    );
+
+    if (!result.session || typeof result.session !== "string") {
+      throw new Error("FlareSolverr did not return a session ID");
+    }
+
+    flareSolverrSessionId = result.session;
+    flareSolverrLastUsedAt = Date.now();
+    console.log("[PROXY] FlareSolverr browser session created");
+    return flareSolverrSessionId;
+  })();
+
+  try {
+    return await flareSolverrSessionPromise;
+  } finally {
+    flareSolverrSessionPromise = null;
+  }
+}
+
+/**
+ * Fetch a URL through a persistent FlareSolverr browser session.
+ *
+ * @param {string} url - Absolute target URL
+ * @param {Object} options - Request options
+ * @param {number} options.timeout - Request timeout in milliseconds
+ * @param {string} options.returnType - "text" or "json"
+ * @param {string} options.sessionId - Existing session ID to reuse
+ * @returns {Promise<{data: string|Object, proxy: string, status: number, sessionId: string}>}
+ */
+async function fetchViaFlareSolverr(url, options = {}) {
+  const {
+    timeout = FLARESOLVERR_MAX_TIMEOUT,
+    returnType = "text",
+    sessionId: suppliedSessionId = null,
+  } = options;
+
+  let targetUrl;
+  try {
+    const parsedUrl = new URL(url);
+    if (!["http:", "https:"].includes(parsedUrl.protocol)) throw new Error("Unsupported URL protocol");
+    targetUrl = parsedUrl.href;
+  } catch {
+    throw new Error("FlareSolverr requires an absolute HTTP(S) URL");
+  }
+
+  const requestTimeout = Math.max(10000, Math.min(timeout, FLARESOLVERR_MAX_TIMEOUT));
+  const sendRequest = async (activeSessionId) => {
+    const result = await sendFlareSolverrCommand(
+      {
+        cmd: "request.get",
+        url: targetUrl,
+        session: activeSessionId,
+        maxTimeout: requestTimeout,
+      },
+      requestTimeout + 15000
+    );
+
+    const solution = result.solution || {};
+    const status = Number(solution.status || 200);
+    if (status < 200 || status >= 400) {
+      const error = new Error(`FlareSolverr target returned HTTP ${status}`);
+      error.status = status;
+      throw error;
+    }
+
+    let data = solution.response;
+    if (data === undefined || data === null) {
+      throw new Error("FlareSolverr returned an empty response body");
+    }
+
+    if (typeof data === "string" && (
+      data.includes("Just a moment...") ||
+      data.includes("Checking your browser")
+    )) {
+      throw new Error("FlareSolverr returned a browser challenge page");
+    }
+
+    if (returnType === "json" && typeof data === "string") {
+      try {
+        data = JSON.parse(data);
+      } catch {
+        throw new Error("FlareSolverr response was not valid JSON");
+      }
+    }
+
+    flareSolverrLastUsedAt = Date.now();
+    return {
+      data,
+      proxy: "flaresolverr",
+      status,
+      sessionId: activeSessionId,
+    };
+  };
+
+  const activeSessionId = suppliedSessionId || await getFlareSolverrSession();
+
+  try {
+    return await sendRequest(activeSessionId);
+  } catch (error) {
+    const invalidSession = /session.*(?:not found|does not exist|invalid)|unknown session/i.test(error.message);
+    if (!invalidSession) throw error;
+
+    if (activeSessionId === flareSolverrSessionId) {
+      flareSolverrSessionId = null;
+      flareSolverrLastUsedAt = 0;
+    }
+
+    console.log("[PROXY] FlareSolverr session expired; creating a new session");
+    const replacementSessionId = await getFlareSolverrSession();
+    return sendRequest(replacementSessionId);
+  }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -206,6 +374,6 @@ async function fetchWithProxy(url, options = {}) {
   }
 }
 
-export { fetchWithProxy, getProxyStatus };
+export { fetchWithProxy, fetchViaFlareSolverr, getFlareSolverrSession, destroyFlareSolverrSession, getProxyStatus };
 
 // ══════════════════════════════════════════════════════════════ END: proxy.helper.js
